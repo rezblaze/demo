@@ -1,1 +1,64 @@
-test2
+---
+- name: Bond two interfaces on RHEL 8 with LACP and VLAN support
+  hosts: all
+  become: yes
+  vars_files:
+    - build.json
+
+  tasks:
+    - name: Ensure NetworkManager is installed and enabled
+      ansible.builtin.yum:
+        name: NetworkManager
+        state: present
+
+    - name: Create a bond connection using LACP (802.3ad)
+      ansible.builtin.shell: |
+        nmcli connection add type bond con-name {{ bond_name }} ifname {{ bond_name }} mode {{ bond_mode }} miimon {{ bond_miimon }}
+      when: bond_state == "present"
+      ignore_errors: yes
+
+    - name: Add interfaces to the bond
+      ansible.builtin.shell: |
+        nmcli connection add type ethernet con-name {{ item }} ifname {{ item }} master {{ bond_name }}
+      loop: "{{ interfaces }}"
+      when: bond_state == "present"
+      ignore_errors: yes
+
+    - name: Configure VLAN on the bond (if VLAN is required)
+      ansible.builtin.shell: |
+        nmcli connection add type vlan con-name {{ bond_name }}-vlan id {{ vlan_id }} dev {{ bond_name }}
+      when: vlan == "yes" and bond_state == "present"
+      ignore_errors: yes
+
+    - name: Bring up the bond and the interfaces
+      ansible.builtin.shell: |
+        nmcli connection up {{ bond_name }}
+        nmcli connection up {{ item }}
+      loop: "{{ interfaces }}"
+      when: bond_state == "present"
+      ignore_errors: yes
+
+    - name: Bring up VLAN (if VLAN is required)
+      ansible.builtin.shell: |
+        nmcli connection up {{ bond_name }}-vlan
+      when: vlan == "yes" and bond_state == "present"
+      ignore_errors: yes
+
+    - name: Ping gateway to ensure bond is active
+      ansible.builtin.command:
+        cmd: ping -c 3 {{ gateway }}
+      register: ping_result
+      ignore_errors: yes
+
+    - name: Revert the bond if the ping fails
+      ansible.builtin.shell: |
+        nmcli connection delete {{ bond_name }}
+        nmcli connection delete {{ bond_name }}-vlan
+      when: ping_result.rc != 0 and bond_state == "present"
+
+    - name: Remove bond if state is absent
+      ansible.builtin.shell: |
+        nmcli connection delete {{ bond_name }}
+        nmcli connection delete {{ bond_name }}-vlan
+      when: bond_state == "absent"
+
