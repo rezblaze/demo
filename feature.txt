@@ -1,1 +1,13 @@
-new featuer
+import ipaddress
+
+def netmask_to_cidr(netmask):
+    # Convert the netmask to an IPv4 network object
+    net = ipaddress.IPv4Network(f'0.0.0.0/{netmask}', strict=False)
+    
+    # Return the prefix length (CIDR)
+    return net.prefixlen
+
+# Example usage:
+netmask = "255.255.255.0"
+cidr = netmask_to_cidr(netmask)
+print(f"Netmask: {netmask} -> CIDR: /{cidr}")
