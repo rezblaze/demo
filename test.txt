@@ -10,3 +10,45 @@
     - name: Show full details of the primary network interface
       ansible.builtin.debug:
         var: ansible_facts['ansible_default_ipv4']
+
+
+
+---
+- name: Register polGrp ID for the primary interface and find matching secondary interface
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: Get the primary interface
+      ansible.builtin.set_fact:
+        primary_interface: "{{ ansible_facts['ansible_default_ipv4']['interface'] }}"
+    
+    - name: Register the polGrp ID for the primary interface
+      ansible.builtin.command:
+        cmd: "lldptool -i {{ primary_interface }} get-tlv -n | grep -i polGrp"
+      register: primary_polGrp
+      ignore_errors: yes
+    
+    - name: Extract the polGrp ID for the primary interface
+      ansible.builtin.set_fact:
+        primary_polGrp_id: "{{ primary_polGrp.stdout | regex_search('polGrp.*') }}"
+    
+    - name: Get all non-primary interfaces
+      ansible.builtin.set_fact:
+        secondary_interfaces: "{{ ansible_facts['ansible_interfaces'] | difference([primary_interface]) }}"
+
+    - name: Check secondary interfaces for matching polGrp ID
+      ansible.builtin.command:
+        cmd: "lldptool -i {{ item }} get-tlv -n | grep -i polGrp"
+      loop: "{{ secondary_interfaces }}"
+      register: secondary_polGrp_results
+      ignore_errors: yes
+    
+    - name: Filter secondary interfaces with matching polGrp ID
+      ansible.builtin.set_fact:
+        matching_interfaces: "{{ secondary_polGrp_results.results | selectattr('stdout', 'search', primary_polGrp_id) | map(attribute='item') | list }}"
+
+    - name: Show the secondary interfaces with matching polGrp ID
+      ansible.builtin.debug:
+        var: matching_interfaces
