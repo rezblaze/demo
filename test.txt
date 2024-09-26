@@ -1,1 +1,12 @@
-test 123
+---
+- name: Gather facts and find the primary interface
+  hosts: all
+  gather_facts: yes
+  tasks:
+    - name: Show the primary network interface
+      ansible.builtin.debug:
+        var: ansible_facts['ansible_default_ipv4']['interface']
+
+    - name: Show full details of the primary network interface
+      ansible.builtin.debug:
+        var: ansible_facts['ansible_default_ipv4']
