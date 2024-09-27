@@ -1,13 +1,97 @@
-import ipaddress
+---
+- name: Bond two interfaces based on the primary interface and revert if ping fails
+  hosts: all
+  become: yes
+  gather_facts: yes
 
-def netmask_to_cidr(netmask):
-    # Convert the netmask to an IPv4 network object
-    net = ipaddress.IPv4Network(f'0.0.0.0/{netmask}', strict=False)
-    
-    # Return the prefix length (CIDR)
-    return net.prefixlen
+  vars:
+    bond_name: bond0
+    bond_mode: "802.3ad"  # Use "active-backup" for active-backup mode, or "802.3ad" for LACP.
+    ping_count: 5
+    ping_interval: 1
 
-# Example usage:
-netmask = "255.255.255.0"
-cidr = netmask_to_cidr(netmask)
-print(f"Netmask: {netmask} -> CIDR: /{cidr}")
+  tasks:
+    - name: Get the primary interface
+      ansible.builtin.set_fact:
+        primary_interface: "{{ ansible_facts['ansible_default_ipv4']['interface'] }}"
+
+    - name: Get all non-primary interfaces
+      ansible.builtin.set_fact:
+        secondary_interfaces: "{{ ansible_facts['ansible_interfaces'] | difference([primary_interface]) }}"
+
+    - name: Ensure at least one secondary interface is available
+      ansible.builtin.fail:
+        msg: "No secondary interface available to create bond."
+      when: secondary_interfaces | length == 0
+
+    - name: Check for VLAN on the primary interface
+      ansible.builtin.command:
+        cmd: "ip link show {{ primary_interface }} | grep '@'"
+      register: vlan_check
+      ignore_errors: yes
+
+    - name: Set VLAN interface if detected
+      ansible.builtin.set_fact:
+        primary_interface: "{{ primary_interface | regex_replace('^([^@]+)@.+', '\\1') }}"
+      when: vlan_check.stdout != ""
+
+    - name: Configure bond interface
+      ansible.builtin.nmcli:
+        conn_name: "{{ bond_name }}"
+        ifname: "{{ bond_name }}"
+        type: bond
+        autoconnect: yes
+        bond.options:
+          mode: "{{ bond_mode }}"
+          miimon: "100"
+          downdelay: "200"
+          updelay: "200"
+        state: present
+
+    - name: Add primary interface to the bond
+      ansible.builtin.nmcli:
+        conn_name: "{{ bond_name }}-primary"
+        ifname: "{{ primary_interface }}"
+        type: ethernet
+        master: "{{ bond_name }}"
+        autoconnect: yes
+        state: present
+
+    - name: Add secondary interface to the bond
+      ansible.builtin.nmcli:
+        conn_name: "{{ bond_name }}-secondary"
+        ifname: "{{ secondary_interfaces[0] }}"  # Pick the first available secondary interface
+        type: ethernet
+        master: "{{ bond_name }}"
+        autoconnect: yes
+        state: present
+
+    - name: Bring up the bond interface
+      ansible.builtin.nmcli:
+        ifname: "{{ bond_name }}"
+        state: up
+
+    - name: Ping the gateway to verify bond
+      ansible.builtin.command:
+        cmd: "ping -c {{ ping_count }} -i {{ ping_interval }} {{ ansible_facts['ansible_default_ipv4']['gateway'] }}"
+      register: ping_result
+      ignore_errors: yes
+
+    - name: Revert the bond if ping fails
+      ansible.builtin.block:
+        - name: Delete the bond interface
+          ansible.builtin.nmcli:
+            conn_name: "{{ bond_name }}"
+            state: absent
+
+        - name: Bring up the primary interface
+          ansible.builtin.nmcli:
+            ifname: "{{ primary_interface }}"
+            state: up
+
+      when: ping_result.rc != 0
+
+    - name: Show success message if bonding is successful
+      ansible.builtin.debug:
+        msg: "Bond successfully created and verified."
+      when: ping_result.rc == 0
