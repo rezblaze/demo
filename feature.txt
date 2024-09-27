@@ -1,97 +1,103 @@
 ---
-- name: Bond two interfaces based on the primary interface and revert if ping fails
+- name: Bond two interfaces and revert if it fails to ping the gateway
   hosts: all
   become: yes
   gather_facts: yes
 
-  vars:
-    bond_name: bond0
-    bond_mode: "802.3ad"  # Use "active-backup" for active-backup mode, or "802.3ad" for LACP.
-    ping_count: 5
-    ping_interval: 1
-
   tasks:
-    - name: Get the primary interface
-      ansible.builtin.set_fact:
-        primary_interface: "{{ ansible_facts['ansible_default_ipv4']['interface'] }}"
-
-    - name: Get all non-primary interfaces
-      ansible.builtin.set_fact:
-        secondary_interfaces: "{{ ansible_facts['ansible_interfaces'] | difference([primary_interface]) }}"
-
-    - name: Ensure at least one secondary interface is available
-      ansible.builtin.fail:
-        msg: "No secondary interface available to create bond."
-      when: secondary_interfaces | length == 0
-
-    - name: Check for VLAN on the primary interface
-      ansible.builtin.command:
-        cmd: "ip link show {{ primary_interface }} | grep '@'"
+    - name: Get the primary interface from facts
+      set_fact:
+        primary_interface: "{{ ansible_default_ipv4.interface }}"
+    
+    - name: Gather network interfaces for the host
+      ansible.builtin.debug:
+        var: ansible_facts['ansible_interfaces']
+    
+    - name: Check if primary interface has VLAN
+      shell: "ip -o link show | grep '{{ primary_interface }}' | grep -c '\.'"
       register: vlan_check
-      ignore_errors: yes
+      changed_when: False
 
-    - name: Set VLAN interface if detected
-      ansible.builtin.set_fact:
-        primary_interface: "{{ primary_interface | regex_replace('^([^@]+)@.+', '\\1') }}"
-      when: vlan_check.stdout != ""
+    - name: Set VLAN tag fact if a VLAN is present
+      set_fact:
+        vlan_tag: "{{ primary_interface.split('.')[1] }}"
+      when: vlan_check.stdout | int > 0
 
-    - name: Configure bond interface
-      ansible.builtin.nmcli:
-        conn_name: "{{ bond_name }}"
-        ifname: "{{ bond_name }}"
-        type: bond
-        autoconnect: yes
-        bond.options:
-          mode: "{{ bond_mode }}"
-          miimon: "100"
-          downdelay: "200"
-          updelay: "200"
-        state: present
+    - name: Find the secondary interface (assume it's the next available interface)
+      set_fact:
+        secondary_interface: "{{ ansible_facts['ansible_interfaces'] | difference([primary_interface]) | first }}"
 
-    - name: Add primary interface to the bond
-      ansible.builtin.nmcli:
-        conn_name: "{{ bond_name }}-primary"
+    - name: Create bond interface with mode LACP or active-backup
+      nmcli:
+        conn_name: "bond0"
+        ifname: "bond0"
+        type: "bond"
+        mode: "{{ bond_mode }}"
+        ip4: "{{ ansible_default_ipv4.address }}/{{ ansible_default_ipv4.network }}"
+        gw4: "{{ ansible_default_ipv4.gateway }}"
+        state: up
+      vars:
+        bond_mode: lacp   # Set to either 'lacp' or 'active-backup'
+      notify: restart network
+
+    - name: Add primary interface to bond
+      nmcli:
+        conn_name: "{{ primary_interface }}-bond"
         ifname: "{{ primary_interface }}"
-        type: ethernet
-        master: "{{ bond_name }}"
-        autoconnect: yes
-        state: present
-
-    - name: Add secondary interface to the bond
-      ansible.builtin.nmcli:
-        conn_name: "{{ bond_name }}-secondary"
-        ifname: "{{ secondary_interfaces[0] }}"  # Pick the first available secondary interface
-        type: ethernet
-        master: "{{ bond_name }}"
-        autoconnect: yes
-        state: present
-
-    - name: Bring up the bond interface
-      ansible.builtin.nmcli:
-        ifname: "{{ bond_name }}"
+        master: bond0
         state: up
 
-    - name: Ping the gateway to verify bond
-      ansible.builtin.command:
-        cmd: "ping -c {{ ping_count }} -i {{ ping_interval }} {{ ansible_facts['ansible_default_ipv4']['gateway'] }}"
+    - name: Add secondary interface to bond
+      nmcli:
+        conn_name: "{{ secondary_interface }}-bond"
+        ifname: "{{ secondary_interface }}"
+        master: bond0
+        state: up
+
+    - name: Check if VLAN needs to be bonded
+      when: vlan_check.stdout | int > 0
+      block:
+        - name: Create VLAN on bond
+          nmcli:
+            conn_name: "bond0.{{ vlan_tag }}"
+            ifname: "bond0.{{ vlan_tag }}"
+            type: vlan
+            vlan_id: "{{ vlan_tag }}"
+            state: up
+
+    - name: Test bond by pinging the gateway
+      ansible.builtin.ping:
+        count: 5
+        dest: "{{ ansible_default_ipv4.gateway }}"
       register: ping_result
       ignore_errors: yes
 
-    - name: Revert the bond if ping fails
-      ansible.builtin.block:
-        - name: Delete the bond interface
-          ansible.builtin.nmcli:
-            conn_name: "{{ bond_name }}"
+    - name: Revert bond if ping fails
+      when: ping_result is failed
+      block:
+        - name: Remove bond
+          nmcli:
+            conn_name: "bond0"
+            state: absent
+        
+        - name: Remove VLAN on bond (if present)
+          when: vlan_check.stdout | int > 0
+          nmcli:
+            conn_name: "bond0.{{ vlan_tag }}"
             state: absent
 
-        - name: Bring up the primary interface
-          ansible.builtin.nmcli:
-            ifname: "{{ primary_interface }}"
+        - name: Restore original network connections
+          nmcli:
+            conn_name: "{{ primary_interface }}"
             state: up
 
-      when: ping_result.rc != 0
+        - name: Restore secondary interface
+          nmcli:
+            conn_name: "{{ secondary_interface }}"
+            state: up
 
-    - name: Show success message if bonding is successful
-      ansible.builtin.debug:
-        msg: "Bond successfully created and verified."
-      when: ping_result.rc == 0
+  handlers:
+    - name: Restart network
+      service:
+        name: NetworkManager
+        state: restarted
