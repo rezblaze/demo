@@ -211,33 +211,39 @@ check_interface() {
 find_nic() {
     IFACE=$(ip -br link|awk '{IGNORECASE=1}/<MAC>/{print $1}'|sort -u)
     if [[ -z ${IFACE} ]]; then
-        echo "- FAIL,  Unable to get the interface with MAC <MAC> ..."
+        echo "- FAIL, Unable to get the interface with MAC <MAC> ..."
     fi
-    
     check_interface ${IFACE}
-    if [[ $? != 0 ]]; then
-        # If primary interface fails, try others
-        NICS=$(ls /sys/class/net | grep -Ev "lo|${IFACE}")
-        for i in ${NICS}; do
-            check_interface ${i}
-            if [[ $? == 0 ]]; then
-                echo "Using alternate interface ${i}"
-                cat << EOF > /tmp/network-ks.cfg
-network --device=${i} --bootproto static --ip=${IP} --netmask=${NETMASK} --gateway=${GATEWAY} --vlanid='${VLAN}' --activate
+    if [[ $? != 1 ]]; then
+        echo "Config INTERFACE ${IFACE}"
+        cat << EOF > /tmp/network-ks.cfg
+network --device=${IFACE} --bootproto static --ip=<IP> --netmask=<NETMASK> --gateway=<GATEWAY> --nameserver=<DNS1>,<DNS2> --hostname=<SERVERNAME> --vlanid='<VLAN>' --activate
 EOF
+    else
+        NICS=$(ls /sys/class/net|grep -Ev "lo|${IFACE}")
+        MSG="ZTP:KS:WARNING: Primary ${IFACE} failed. Checking interfaces ${NICS}"
+        ${LOG_TO_LOM} "${MSG}"
+
+        WORKING_IFACE_FOUND=false
+        for i in ${NICS}; do
+            echo "FOR LOOP CODE CHECK on ${i}"
+            sleep 5
+            check_interface ${i}
+            if [[ $? != 1 ]]; then
+                MSG="ZTP:KS:WARNING: NON standard Interface ${i} is working!"
+                ${LOG_TO_LOM} "${MSG}"
+                cat << EOF > /tmp/network-ks.cfg
+network --device=${i} --bootproto static --ip=<IP> --netmask=<NETMASK> --gateway=<GATEWAY> --nameserver=<DNS1>,<DNS2> --hostname=<SERVERNAME> --vlanid='<VLAN>' --activate
+EOF
+                WORKING_IFACE_FOUND=true
                 break
             fi
         done
-        
-        # If no interface worked
-        if [[ $? != 0 ]]; then
+
+        if [[ "${WORKING_IFACE_FOUND}" == false ]]; then
             ${LOG_TO_LOM} 'ZTP:KS:Pre_primary_network_check_FAIL'
             exit 1
         fi
-    else
-        cat << EOF > /tmp/network-ks.cfg
-network --device=${IFACE} --bootproto static --ip=${IP} --netmask=${NETMASK} --gateway=${GATEWAY} --vlanid='${VLAN}' --activate
-EOF
     fi
 }
 
